@@ -1,23 +1,21 @@
-// Rust translation of snapshot-finder.py
-// Minimal single-file program. Not a byte-for-byte port but preserves behavior.
-// Cargo dependencies (add to Cargo.toml):
+#![allow(unused_variables)]
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::blocking::{Client, Response};
-use reqwest::header::LOCATION;
+use log::error;
+use reqwest::redirect::Policy;
+use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::fs;
-use std::io::{self, Read, Write};
-use std::path::Path;
-use std::process::Command;
+use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
-use threadpool::ThreadPool;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Solana snapshot finder - rust port", long_about = None)]
@@ -35,14 +33,8 @@ struct Args {
     #[arg(long = "slot", default_value_t = 0)]
     slot: u64,
 
-    #[arg(long = "version")]
-    version: Option<String>,
-
-    #[arg(long = "wildcard_version")]
-    wildcard_version: Option<String>,
-
     #[arg(long = "max_snapshot_age", default_value_t = 1300)]
-    max_snapshot_age: i64,
+    max_snapshot_age: u64,
 
     #[arg(long = "min_download_speed", default_value_t = 60)]
     min_download_speed: u64,
@@ -50,13 +42,13 @@ struct Args {
     #[arg(long = "max_download_speed")]
     max_download_speed: Option<u64>,
 
-    #[arg(long = "max_latency", default_value_t = 100)]
+    #[arg(long = "max_latency", default_value_t = 200)]
     max_latency: u64,
 
     #[arg(long = "with_private_rpc", default_value_t = false)]
     with_private_rpc: bool,
 
-    #[arg(long = "measurement_time", default_value_t = 7)]
+    #[arg(long = "measurement_time", default_value_t = 5)]
     measurement_time: u64,
 
     #[arg(long = "snapshot_path", default_value = ".")]
@@ -69,6 +61,7 @@ struct Args {
     sleep: u64,
 
     #[arg(long = "sort_order", default_value = "latency")]
+    /// Sorting order. Can be "latency" or "slot_diff".
     sort_order: String,
 
     #[arg(short = 'b', long = "blacklist", default_value = "")]
@@ -82,17 +75,8 @@ struct Args {
 struct RpcNodeInfo {
     snapshot_address: String,
     slots_diff: i64,
-    latency: f64,
+    latency_ms: u64,
     files_to_download: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct JsonData {
-    last_update_at: f64,
-    last_update_slot: u64,
-    total_rpc_nodes: usize,
-    rpc_nodes_with_actual_snapshot: usize,
-    rpc_nodes: Vec<RpcNodeInfo>,
 }
 
 fn convert_size(size_bytes: u128) -> String {
@@ -106,26 +90,27 @@ fn convert_size(size_bytes: u128) -> String {
     format!("{:.2} {}", s, size_name[i])
 }
 
-fn measure_speed(client: &Client, url: &str, measure_time: u64) -> Result<f64> {
+async fn measure_speed(url: &str, measure_time: u64) -> Result<f64> {
     let full = format!("http://{}/snapshot.tar.bz2", url);
+    let client = Client::new();
     let mut resp = client
         .get(&full)
-        .timeout(Duration::from_secs((measure_time + 2) as u64))
-        .send()?;
+        .timeout(Duration::from_secs(measure_time + 2))
+        .send()
+        .await?;
     resp.error_for_status_ref()?;
 
     let start = Instant::now();
     let mut last = start;
-    let mut buf = [0u8; 81920];
     let mut loaded: usize = 0;
     let mut speeds: Vec<f64> = Vec::new();
 
     while start.elapsed().as_secs() < measure_time {
         let now = Instant::now();
-        match resp.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                loaded += n;
+        match resp.chunk().await {
+            Ok(None) => break,
+            Ok(Some(bytes)) => {
+                loaded += bytes.len();
                 let delta = now.duration_since(last).as_secs_f64();
                 if delta > 1.0 {
                     let estimated_bps = (loaded as f64) / delta;
@@ -145,77 +130,71 @@ fn measure_speed(client: &Client, url: &str, measure_time: u64) -> Result<f64> {
     Ok(mid)
 }
 
-fn do_request(
-    client: &Client,
-    url: &str,
-    method: &str,
-    data: Option<&str>,
-    timeout_secs: u64,
-) -> Result<Response> {
-    let req = match method.to_lowercase().as_str() {
-        "get" => client.get(url),
-        "post" => client.post(url).body(data.unwrap_or("".into()).to_string()),
-        "head" => client.head(url),
-        _ => client.get(url),
-    };
-    let resp = req.timeout(Duration::from_secs(timeout_secs)).send()?;
-    Ok(resp)
+pub enum HttpRequest<'a> {
+    Get,
+    Head,
+    Post(&'a str),
 }
 
-fn get_current_slot(client: &Client, rpc: &str) -> Option<u64> {
-    let d = r#"{"jsonrpc":"2.0","id":1, "method":"getSlot"}"#;
-    match do_request(client, rpc, "post", Some(d), 25) {
-        Ok(mut r) => match r.text() {
-            Ok(text) => {
-                if text.contains("result") {
-                    match serde_json::from_str::<Value>(&text) {
-                        Ok(v) => return v["result"].as_u64(),
-                        Err(_) => return None,
-                    }
-                }
-                None
-            }
-            Err(_) => None,
-        },
-        Err(_) => None,
+impl<'a> HttpRequest<'a> {
+    pub async fn send(self, url: &str, timeout_secs: u64) -> Result<Response> {
+        let client = Client::builder().redirect(Policy::none()).build()?;
+
+        let req = match self {
+            HttpRequest::Get => client.get(url),
+            HttpRequest::Head => client.head(url),
+            HttpRequest::Post(body) => client
+                .post(url)
+                .body(body.to_owned())
+                .header("Content-Type", "application/json"),
+        };
+
+        let resp = req
+            .timeout(Duration::from_secs(timeout_secs))
+            .send()
+            .await?;
+
+        Ok(resp)
     }
 }
 
-fn get_all_rpc_ips(
-    client: &Client,
+async fn get_current_slot(rpc: &str) -> Result<u64> {
+    let d = r#"{"jsonrpc":"2.0","id":1, "method":"getSlot"}"#;
+    let r = HttpRequest::Post(d).send(rpc, 5).await?;
+    let text = r.text().await?;
+    dbg!(&text);
+    if text.contains("result") {
+        let v = serde_json::from_str::<Value>(&text)?;
+        v["result"]
+            .as_u64()
+            .context("Could not parse slot in RPC result")
+    } else {
+        anyhow::bail!("No result in returned json");
+    }
+}
+
+async fn get_all_rpc_ips(
     rpc: &str,
-    wildcard: &Option<String>,
-    specific_version: &Option<String>,
     with_private: bool,
     ip_blacklist: &HashSet<String>,
-    discarded_by_version: &mut usize,
 ) -> Result<Vec<String>> {
     let d = r#"{"jsonrpc":"2.0", "id":1, "method":"getClusterNodes"}"#;
     let mut result_ips: Vec<String> = Vec::new();
-    let resp = do_request(client, rpc, "post", Some(d), 25)?;
-    let txt = resp.text()?;
+    let resp = HttpRequest::Post(d).send(rpc, 5).await?;
+    let txt = resp.text().await?;
     if !txt.contains("result") {
         anyhow::bail!("Can't get RPC ip addresses: {}", txt);
     }
     let v: Value = serde_json::from_str(&txt)?;
     if let Some(nodes) = v["result"].as_array() {
         for node in nodes {
-            let version = node["version"].as_str().unwrap_or("");
-            if (wildcard.is_some() && !version.contains(wildcard.as_ref().unwrap()))
-                || (specific_version.is_some() && version != specific_version.as_ref().unwrap())
-            {
-                *discarded_by_version += 1;
-                continue;
-            }
             if let Some(rpc_field) = node["rpc"].as_str() {
                 result_ips.push(rpc_field.to_string());
-            } else if with_private {
-                if let Some(gossip) = node["gossip"].as_str() {
-                    if let Some(host) = gossip.split(':').next() {
+            } else if with_private
+                && let Some(gossip) = node["gossip"].as_str()
+                    && let Some(host) = gossip.split(':').next() {
                         result_ips.push(format!("{}:8899", host));
                     }
-                }
-            }
         }
     }
     // dedupe and filter blacklist
@@ -228,157 +207,169 @@ fn get_all_rpc_ips(
     Ok(filtered)
 }
 
-fn get_snapshot_slot(
-    client: &Client,
+async fn get_snapshot_slot(
     rpc_address: String,
+    full_local_snap_slot: u64,
     current_slot: u64,
-    max_snapshot_age: i64,
+    max_snapshot_age_in_slots: u64,
     max_latency_ms: u64,
-    full_local_snap_slot: Option<String>,
-    json_nodes: Arc<Mutex<Vec<RpcNodeInfo>>>,
-    pbar: Arc<ProgressBar>,
-    discarded_counters: Arc<Mutex<(usize, usize, usize)>>,
-) {
-    // counters tuple: (arch_type, latency, slot)
-    pbar.inc(1);
-    let snap_url = format!("http://{}/snapshot.tar.bz2", rpc_address);
-    let inc_url = format!("http://{}/incremental-snapshot.tar.bz2", rpc_address);
+) -> Option<RpcNodeInfo> {
+    let url = format!("http://{rpc_address}/snapshot.tar.bz2");
+    let inc_url = format!("http://{rpc_address}/incremental-snapshot.tar.bz2");
 
-    // try incremental
-    if let Ok(r) = do_request(client, &inc_url, "head", None, 1) {
-        let elapsed_ms = r.elapsed().map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
-        if elapsed_ms as u64 > max_latency_ms {
-            let mut c = discarded_counters.lock().unwrap();
-            c.1 += 1;
-            return;
+    let t0 = Instant::now();
+    let inc_resp = HttpRequest::Head.send(&inc_url, 3).await.ok()?;
+    let latency_ms = t0.elapsed().as_millis() as u64;
+
+    if latency_ms > max_latency_ms {
+        return None;
+    }
+
+    let headers_str = format!("{:?}", inc_resp.headers());
+    dbg!(&headers_str);
+    if !headers_str.contains("location") {
+        return None;
+    }
+    if let Some(incremental_snap_location) = inc_resp
+        .headers()
+        .get("location")
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned)
+    {
+        dbg!(&incremental_snap_location);
+        if incremental_snap_location.ends_with("tar") {
+            return None;
         }
-        if let Some(loc) = r.headers().get(LOCATION) {
-            if let Ok(loc_s) = loc.to_str() {
-                if loc_s.ends_with(".tar") {
-                    let mut c = discarded_counters.lock().unwrap();
-                    c.0 += 1;
-                    return;
-                }
-                let parts: Vec<&str> = loc_s.split('-').collect();
-                if parts.len() >= 4 {
-                    if let (Ok(incremental_snap_slot), Ok(snap_slot)) =
-                        (parts[2].parse::<u64>(), parts[3].parse::<u64>())
-                    {
-                        let slots_diff = current_slot as i64 - snap_slot as i64;
-                        if slots_diff < -100 {
-                            let mut c = discarded_counters.lock().unwrap();
-                            c.2 += 1;
-                            return;
-                        }
-                        if slots_diff > max_snapshot_age {
-                            let mut c = discarded_counters.lock().unwrap();
-                            c.2 += 1;
-                            return;
-                        }
-                        if full_local_snap_slot
-                            .as_ref()
-                            .map(|s| s.parse::<u64>().ok())
-                            .flatten()
-                            == Some(incremental_snap_slot)
-                        {
-                            let mut nodes = json_nodes.lock().unwrap();
-                            nodes.push(RpcNodeInfo {
-                                snapshot_address: rpc_address.clone(),
-                                slots_diff,
-                                latency: elapsed_ms,
-                                files_to_download: vec![loc_s.to_string()],
-                            });
-                            return;
-                        }
-                        // try full
-                        if let Ok(r2) = do_request(client, &snap_url, "head", None, 1) {
-                            if let Some(loc2) = r2.headers().get(LOCATION) {
-                                let mut nodes = json_nodes.lock().unwrap();
-                                nodes.push(RpcNodeInfo {
-                                    snapshot_address: rpc_address.clone(),
-                                    slots_diff,
-                                    latency: elapsed_ms,
-                                    files_to_download: vec![
-                                        loc_s.to_string(),
-                                        loc2.to_str().unwrap_or("").to_string(),
-                                    ],
-                                });
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
+
+        let parts: Vec<&str> = incremental_snap_location.split('-').collect();
+        if parts.len() < 4 {
+            return None;
+        }
+
+        let incremental_snap_slot = parts[2].parse::<u64>().ok()?;
+        let snap_slot = parts[3].parse::<u64>().ok()?;
+        let slots_diff = current_slot as i64 - snap_slot as i64;
+
+        if slots_diff < -100 {
+            error!(
+                "Invalid snapshot from node {}; slots_diff={}",
+                rpc_address, slots_diff
+            );
+            return None;
+        }
+
+        if slots_diff > max_snapshot_age_in_slots as i64 {
+            return None;
+        }
+
+        if full_local_snap_slot == incremental_snap_slot {
+            return Some(RpcNodeInfo {
+                snapshot_address: rpc_address.clone(),
+                slots_diff,
+                latency_ms,
+                files_to_download: vec![incremental_snap_location],
+            });
+        }
+
+        let full_resp = HttpRequest::Head.send(&url, 1).await.ok()?;
+
+        if let Some(full_snap_location) = full_resp
+            .headers()
+            .get("location")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_owned)
+        {
+            return Some(RpcNodeInfo {
+                snapshot_address: rpc_address.clone(),
+                slots_diff,
+                latency_ms,
+                files_to_download: vec![incremental_snap_location, full_snap_location],
+            });
         }
     }
 
-    // try full snapshot
-    if let Ok(r) = do_request(client, &snap_url, "head", None, 1) {
-        let elapsed_ms = r.elapsed().map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
-        if let Some(loc) = r.headers().get(LOCATION) {
-            if let Ok(loc_s) = loc.to_str() {
-                if loc_s.ends_with(".tar") {
-                    let mut c = discarded_counters.lock().unwrap();
-                    c.0 += 1;
-                    return;
-                }
-                // parse full snap slot from snapshot-<slot>-...
-                let parts: Vec<&str> = loc_s.split('-').collect();
-                if parts.len() >= 2 {
-                    if let Ok(full_snap_slot_) = parts[1].parse::<u64>() {
-                        let slots_diff_full = current_slot as i64 - full_snap_slot_ as i64;
-                        if slots_diff_full <= max_snapshot_age
-                            && elapsed_ms as u64 <= max_latency_ms
-                        {
-                            let mut nodes = json_nodes.lock().unwrap();
-                            nodes.push(RpcNodeInfo {
-                                snapshot_address: rpc_address.clone(),
-                                slots_diff: slots_diff_full,
-                                latency: elapsed_ms,
-                                files_to_download: vec![loc_s.to_string()],
-                            });
-                            return;
-                        }
-                    }
-                }
-            }
+    // check full snapshot if incremental didn't match
+    let full_resp = HttpRequest::Head.send(&url, 1).await.ok()?;
+
+    let full_headers = format!("{:?}", full_resp.headers());
+    if !full_headers.contains("location") {
+        return None;
+    }
+    if let Some(full_snap_location) = full_resp
+        .headers()
+        .get("location")
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned)
+    {
+        dbg!(&full_snap_location);
+        if full_snap_location.ends_with("tar") {
+            return None;
+        }
+
+        let parts: Vec<&str> = full_snap_location.split('-').collect();
+        if parts.len() < 2 {
+            return None;
+        }
+
+        let full_snap_slot = parts[1].parse::<u64>().ok()?;
+        let slots_diff_full = current_slot as i64 - full_snap_slot as i64;
+
+        if slots_diff_full <= max_snapshot_age_in_slots as i64 {
+            return Some(RpcNodeInfo {
+                snapshot_address: rpc_address.clone(),
+                slots_diff: slots_diff_full,
+                latency_ms,
+                files_to_download: vec![full_snap_location],
+            });
         }
     }
+
+    None
 }
 
-fn download(
-    wget_path: &str,
+async fn download(
     url: &str,
     snapshot_path: &str,
     max_download_speed_mb: Option<u64>,
 ) -> Result<()> {
     let fname = url.rsplit('/').next().unwrap_or("snapshot.tar.bz2");
     let temp = format!("{}/tmp-{}", snapshot_path, fname);
-    let out = if let Some(max_mb) = max_download_speed_mb {
-        Command::new(wget_path)
-            .arg("--progress=dot:giga")
-            .arg(format!("--limit-rate={}M", max_mb))
-            .arg("--trust-server-names")
-            .arg(url)
-            .arg(format!("-O{}", temp))
-            .output()?
-    } else {
-        Command::new(wget_path)
-            .arg("--progress=dot:giga")
-            .arg("--trust-server-names")
-            .arg(url)
-            .arg(format!("-O{}", temp))
-            .output()?
-    };
-    if !out.status.success() {
-        anyhow::bail!("wget failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
     let dest = format!("{}/{}", snapshot_path, fname);
-    fs::rename(&temp, &dest).with_context(|| format!("renaming {} -> {}", temp, dest))?;
+
+    let client = Client::new();
+    let mut resp = client.get(url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("HTTP error: {}", resp.status());
+    }
+    let size: u64 = resp
+        .headers()
+        .get("content-length")
+        .and_then(|hv| hv.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let pbar = ProgressBar::new(size);
+    pbar.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+        )
+        .unwrap(),
+    );
+
+    let mut file = tokio::fs::File::create(&temp).await?;
+
+    while let Some(chunk) = resp.chunk().await? {
+        file.write_all(&chunk).await?;
+        pbar.inc(chunk.len() as u64);
+    }
+
+    file.flush().await?;
+    tokio::fs::rename(temp, dest).await?;
+    pbar.finish();
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.verbose {
@@ -387,20 +378,14 @@ fn main() -> Result<()> {
         env_logger::init();
     }
 
-    let client = Client::builder()
-        .danger_accept_invalid_certs(false)
-        .build()?;
-
-    let mut full_local_snap_slot: Option<String> = None;
+    let mut full_local_snap_slot: u64 = 0;
     let snapshot_path = if args.snapshot_path.ends_with('/') {
         args.snapshot_path.trim_end_matches('/').to_string()
     } else {
         args.snapshot_path.clone()
     };
 
-    fs::create_dir_all(&snapshot_path)?;
-
-    let wget_path = which::which("wget").context("wget not found; please install wget")?;
+    fs::create_dir_all(&snapshot_path).await?;
 
     let blacklist: Vec<&str> = if args.blacklist.is_empty() {
         vec![]
@@ -409,70 +394,51 @@ fn main() -> Result<()> {
     };
     let ip_blacklist: HashSet<String> = HashSet::new();
 
-    let mut num_attempts = 1u32;
+    let num_attempts = 1u32;
 
-    let mut discarded_by_version = 0usize;
-
-    println!("Version: 0.3.9");
     println!("RPC: {}", args.rpc_address);
 
-    while num_attempts <= args.num_of_retries {
+    for num_attempts in 1..=args.num_of_retries {
         let current_slot = if args.slot != 0 {
             args.slot
         } else {
-            get_current_slot(&client, &args.rpc_address).unwrap_or(0)
+            get_current_slot(&args.rpc_address).await?
         };
         println!(
             "Attempt number: {}. Current slot: {}",
             num_attempts, current_slot
         );
 
-        num_attempts += 1;
+        let nodes = Arc::new(Mutex::new(Vec::<RpcNodeInfo>::new()));
 
-        let mut discarded_counters = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
-        let json_nodes = Arc::new(Mutex::new(Vec::<RpcNodeInfo>::new()));
-
-        let rpc_ips = match get_all_rpc_ips(
-            &client,
-            &args.rpc_address,
-            &args.wildcard_version,
-            &args.version,
-            args.with_private_rpc,
-            &ip_blacklist,
-            &mut discarded_by_version,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("error fetching rpc nodes: {}", e);
-                return Err(e);
-            }
-        };
+        let rpc_ips =
+            get_all_rpc_ips(&args.rpc_address, args.with_private_rpc, &ip_blacklist).await?;
 
         println!("RPC servers in total: {}", rpc_ips.len());
 
         // find local full snapshots
-        let mut full_local_snapshots = glob::glob(&format!("{}/snapshot-*tar*", snapshot_path))?
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>();
+        let mut full_local_snapshots = find_full_local_snapshots(&snapshot_path)
+            .await
+            .with_context(|| format!("Error reading local snapshots from {snapshot_path}"))?;
         full_local_snapshots.sort();
-        full_local_snapshots.reverse();
-        if !full_local_snapshots.is_empty() {
-            if let Some(fname) = full_local_snapshots[0].file_name().and_then(|s| s.to_str()) {
-                // pattern snapshot-<slot>-...
-                let parts: Vec<&str> = fname.split('-').collect();
-                if parts.len() >= 2 {
-                    full_local_snap_slot = Some(parts[1].to_string());
-                    println!(
-                        "Found full local snapshot {} | FULL_LOCAL_SNAP_SLOT={}",
-                        fname, parts[1]
-                    );
-                }
+        if let Some(fname) = full_local_snapshots
+            .last()
+            .and_then(|p| p.file_name())
+            .and_then(OsStr::to_str)
+        {
+            // pattern snapshot-<slot>-...
+            let parts: Vec<&str> = fname.split('-').collect();
+            if parts.len() >= 2 {
+                println!(
+                    "Found full local snapshot {} | FULL_LOCAL_SNAP_SLOT={}",
+                    fname, parts[1]
+                );
+                full_local_snap_slot = parts[1].parse()?;
             }
         }
 
         println!("Searching information about snapshots on all found RPCs");
 
-        let pool = ThreadPool::new(args.threads_count);
         let pbar = Arc::new(ProgressBar::new(rpc_ips.len() as u64));
         pbar.set_style(
             ProgressStyle::with_template(
@@ -481,76 +447,60 @@ fn main() -> Result<()> {
             .unwrap(),
         );
 
+        dbg!(rpc_ips.len());
+        let mut join_set = tokio::task::JoinSet::new();
         for rpc in rpc_ips.into_iter() {
-            let client = client.clone();
-            let json_nodes = Arc::clone(&json_nodes);
             let pbar = Arc::clone(&pbar);
-            let discarded_counters = Arc::clone(&discarded_counters);
-            let rpc_clone = rpc.clone();
-            let full_local_snap_slot = full_local_snap_slot.clone();
-            pool.execute(move || {
-                get_snapshot_slot(
-                    &client,
-                    rpc_clone,
+            join_set.spawn(async move {
+                let res = get_snapshot_slot(
+                    rpc,
+                    full_local_snap_slot,
                     current_slot,
                     args.max_snapshot_age,
                     args.max_latency,
-                    full_local_snap_slot,
-                    json_nodes,
-                    pbar,
-                    discarded_counters,
-                );
+                )
+                .await;
+                pbar.inc(1);
+                res
             });
         }
-        pool.join();
-        pbar.finish();
+        let mut nodes = vec![];
+        while let Some(join_result) = join_set.join_next().await {
+            if let Some(node) = join_result? {
+                nodes.push(node);
+            }
+        }
+        assert!(join_set.is_empty());
 
-        let mut nodes = json_nodes.lock().unwrap();
-        println!("Found suitable RPCs: {}", nodes.len());
+        pbar.finish();
 
         if nodes.is_empty() {
             println!("No snapshot nodes were found matching the given parameters");
-            if num_attempts > args.num_of_retries {
-                break;
-            }
-            thread::sleep(Duration::from_secs(args.sleep));
+            sleep(Duration::from_secs(args.sleep)).await;
             continue;
         }
+        println!("Found suitable RPCs: {}", nodes.len());
 
         // sort
         if args.sort_order == "latency" {
-            nodes.sort_by(|a, b| a.latency.partial_cmp(&b.latency).unwrap());
+            nodes.sort_by(|a, b| a.latency_ms.partial_cmp(&b.latency_ms).unwrap());
         } else {
             nodes.sort_by(|a, b| a.slots_diff.cmp(&b.slots_diff));
         }
-
-        // save json
-        let json_data = JsonData {
-            last_update_at: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
-            last_update_slot: current_slot,
-            total_rpc_nodes: 0,
-            rpc_nodes_with_actual_snapshot: nodes.len(),
-            rpc_nodes: nodes.clone(),
-        };
-        let out_path = format!("{}/snapshot.json", snapshot_path);
-        fs::write(&out_path, serde_json::to_string_pretty(&json_data)?)?;
-        println!("All data is saved to json file - {}", out_path);
-
         // measure speeds and try download
         let mut unsuitable_servers: HashSet<String> = HashSet::new();
-        let mut best_snapshot_node = String::new();
+        let best_snapshot_node = String::new();
         let num_of_rpc_to_check = 15usize;
 
         for (i, rpc_node) in nodes.iter().enumerate() {
-            if !blacklist.is_empty() {
-                if blacklist
+            if !blacklist.is_empty()
+                && blacklist
                     .iter()
                     .any(|b| rpc_node.files_to_download.iter().any(|p| p.contains(b)))
                 {
                     println!("{}/{} BLACKLISTED --> {:?}", i + 1, nodes.len(), rpc_node);
                     continue;
                 }
-            }
             if unsuitable_servers.contains(&rpc_node.snapshot_address) {
                 println!(
                     "Rpc node already unsuitable --> skip {}",
@@ -565,7 +515,7 @@ fn main() -> Result<()> {
                 rpc_node
             );
             let down_speed_bytes =
-                measure_speed(&client, &rpc_node.snapshot_address, args.measurement_time)?;
+                measure_speed(&rpc_node.snapshot_address, args.measurement_time).await?;
             let down_speed_mb = convert_size(down_speed_bytes as u128);
             if down_speed_bytes < (args.min_download_speed as f64) * 1e6 {
                 println!("Too slow: {} {}", rpc_node.snapshot_address, down_speed_mb);
@@ -573,30 +523,28 @@ fn main() -> Result<()> {
                 continue;
             } else {
                 for path in rpc_node.files_to_download.iter().rev() {
-                    if path.starts_with("/snapshot-") {
+                    println!("Will download {path}");
+                    /*  if path.starts_with("/snapshot-") {
                         let parts: Vec<&str> = path.split('-').collect();
                         if parts.len() >= 2
-                            && full_local_snap_slot
-                                .as_ref()
-                                .map(|s| s == parts[1])
-                                .unwrap_or(false)
+                            && full_local_snap_slot.map(|s| s == parts[1]).unwrap_or(false)
                         {
                             continue;
                         }
-                    }
+                    }*/
                     let mut candidate = String::new();
                     if path.contains("incremental") {
-                        if let Ok(r) = do_request(
-                            &client,
-                            &format!(
-                                "http://{}/incremental-snapshot.tar.bz2",
-                                rpc_node.snapshot_address
-                            ),
-                            "head",
-                            None,
-                            2,
-                        ) {
-                            if let Some(loc) = r.headers().get(LOCATION) {
+                        if let Ok(r) = HttpRequest::Head
+                            .send(
+                                &format!(
+                                    "http://{}/incremental-snapshot.tar.bz2",
+                                    rpc_node.snapshot_address
+                                ),
+                                2,
+                            )
+                            .await
+                        {
+                            if let Some(loc) = r.headers().get("location") {
                                 candidate = format!(
                                     "http://{}{}",
                                     rpc_node.snapshot_address,
@@ -610,27 +558,41 @@ fn main() -> Result<()> {
                         candidate = format!("http://{}{}", rpc_node.snapshot_address, path);
                     }
                     println!("Downloading {} snapshot to {}", candidate, snapshot_path);
-                    download(
-                        wget_path.to_str().unwrap(),
-                        &candidate,
-                        &snapshot_path,
-                        args.max_download_speed,
-                    )?;
+                    download(&candidate, &snapshot_path, args.max_download_speed).await?;
                 }
                 println!("Done");
                 return Ok(());
             }
-            if i + 1 > num_of_rpc_to_check {
-                break;
-            }
         }
-
         println!(
             "No snapshot nodes were found matching the given parameters. RETRY #{}",
-            num_attempts
+            num_attempts + 1
         );
-        thread::sleep(Duration::from_secs(args.sleep));
+        sleep(Duration::from_secs(args.sleep)).await;
     }
 
     anyhow::bail!("Could not find a suitable snapshot")
+}
+
+pub async fn find_full_local_snapshots(snapshot_path: &str) -> Result<Vec<PathBuf>> {
+    let mut entries = tokio::fs::read_dir(snapshot_path)
+        .await
+        .context(format!("Can not read directory {snapshot_path}"))?;
+    let mut matches = Vec::new();
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .context("Can not stat directory entry")?
+    {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with("snapshot-") && name.contains("tar") {
+            matches.push(path);
+        }
+    }
+
+    Ok(matches)
 }
