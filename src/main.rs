@@ -162,7 +162,6 @@ async fn get_current_slot(rpc: &str) -> Result<u64> {
     let d = r#"{"jsonrpc":"2.0","id":1, "method":"getSlot"}"#;
     let r = HttpRequest::Post(d).send(rpc, 5).await?;
     let text = r.text().await?;
-    dbg!(&text);
     if text.contains("result") {
         let v = serde_json::from_str::<Value>(&text)?;
         v["result"]
@@ -192,9 +191,10 @@ async fn get_all_rpc_ips(
                 result_ips.push(rpc_field.to_string());
             } else if with_private
                 && let Some(gossip) = node["gossip"].as_str()
-                    && let Some(host) = gossip.split(':').next() {
-                        result_ips.push(format!("{}:8899", host));
-                    }
+                && let Some(host) = gossip.split(':').next()
+            {
+                result_ips.push(format!("{}:8899", host));
+            }
         }
     }
     // dedupe and filter blacklist
@@ -226,7 +226,6 @@ async fn get_snapshot_slot(
     }
 
     let headers_str = format!("{:?}", inc_resp.headers());
-    dbg!(&headers_str);
     if !headers_str.contains("location") {
         return None;
     }
@@ -236,7 +235,6 @@ async fn get_snapshot_slot(
         .and_then(|h| h.to_str().ok())
         .map(str::to_owned)
     {
-        dbg!(&incremental_snap_location);
         if incremental_snap_location.ends_with("tar") {
             return None;
         }
@@ -301,7 +299,6 @@ async fn get_snapshot_slot(
         .and_then(|h| h.to_str().ok())
         .map(str::to_owned)
     {
-        dbg!(&full_snap_location);
         if full_snap_location.ends_with("tar") {
             return None;
         }
@@ -336,7 +333,9 @@ async fn download(
     let temp = format!("{}/tmp-{}", snapshot_path, fname);
     let dest = format!("{}/{}", snapshot_path, fname);
 
-    let client = Client::new();
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()?;
     let mut resp = client.get(url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("HTTP error: {}", resp.status());
@@ -447,7 +446,6 @@ async fn main() -> Result<()> {
             .unwrap(),
         );
 
-        dbg!(rpc_ips.len());
         let mut join_set = tokio::task::JoinSet::new();
         for rpc in rpc_ips.into_iter() {
             let pbar = Arc::clone(&pbar);
@@ -497,10 +495,10 @@ async fn main() -> Result<()> {
                 && blacklist
                     .iter()
                     .any(|b| rpc_node.files_to_download.iter().any(|p| p.contains(b)))
-                {
-                    println!("{}/{} BLACKLISTED --> {:?}", i + 1, nodes.len(), rpc_node);
-                    continue;
-                }
+            {
+                println!("{}/{} BLACKLISTED --> {:?}", i + 1, nodes.len(), rpc_node);
+                continue;
+            }
             if unsuitable_servers.contains(&rpc_node.snapshot_address) {
                 println!(
                     "Rpc node already unsuitable --> skip {}",
