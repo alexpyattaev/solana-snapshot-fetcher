@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use atomic_token_bucket::TokenBucket;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use log::error;
+use log::{error, trace};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,7 @@ struct Args {
     /// Maximal download speed, Mbps. Specifying this reduces load on the RPC node.
     max_download_speed: Option<u64>,
 
-    #[arg(long = "max_latency", default_value_t = 300)]
+    #[arg(long = "max_latency", default_value_t = 200)]
     /// Maximal latency to RPC in ms. High latency is bad for download speed.
     max_latency: u64,
 
@@ -223,15 +223,10 @@ async fn get_snapshot_slot(
     let latency_ms = t0.elapsed().as_millis() as u64;
 
     if latency_ms > max_latency_ms {
-        dbg!("too slow");
+        trace!("Latency for {rpc_address} too high ({latency_ms}ms)");
         return None;
     }
 
-    let headers_str = format!("{:?}", inc_resp.headers());
-    if !headers_str.contains("location") {
-        dbg!("no location");
-        return None;
-    }
     if let Some(incremental_snap_location) = inc_resp
         .headers()
         .get("location")
@@ -239,11 +234,13 @@ async fn get_snapshot_slot(
         .map(str::to_owned)
     {
         if incremental_snap_location.ends_with("tar") {
+            trace!("{rpc_address}: incorrect file extension");
             return None;
         }
 
         let parts: Vec<&str> = incremental_snap_location.split('-').collect();
         if parts.len() < 4 {
+            trace!("{rpc_address}: invalid path: {parts:?}");
             return None;
         }
 
@@ -260,6 +257,7 @@ async fn get_snapshot_slot(
         }
 
         if slots_diff > max_snapshot_age_in_slots as i64 {
+            trace!("{rpc_address}: too old ({slots_diff} slots)");
             return None;
         }
 
@@ -287,15 +285,14 @@ async fn get_snapshot_slot(
                 files_to_download: vec![incremental_snap_location, full_snap_location],
             });
         }
+    } else {
+        trace!("No location header from {rpc_address}");
+        return None;
     }
 
     // check full snapshot if incremental didn't match
     let full_resp = HttpRequest::Head.send(&url, 1).await.ok()?;
 
-    let full_headers = format!("{:?}", full_resp.headers());
-    if !full_headers.contains("location") {
-        return None;
-    }
     if let Some(full_snap_location) = full_resp
         .headers()
         .get("location")
@@ -303,11 +300,13 @@ async fn get_snapshot_slot(
         .map(str::to_owned)
     {
         if full_snap_location.ends_with("tar") {
+            trace!("{rpc_address}: invalid file format {full_snap_location}");
             return None;
         }
 
         let parts: Vec<&str> = full_snap_location.split('-').collect();
         if parts.len() < 2 {
+            trace!("{rpc_address}: invalid path: {parts:?}");
             return None;
         }
 
@@ -321,8 +320,13 @@ async fn get_snapshot_slot(
                 latency_ms,
                 files_to_download: vec![full_snap_location],
             });
+        } else {
+            trace!("{rpc_address}: too old ({slots_diff_full} slots)");
         }
     }
+
+    trace!("No snapshots on {rpc_address}!");
+
     None
 }
 
