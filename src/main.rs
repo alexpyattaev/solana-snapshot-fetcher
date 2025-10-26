@@ -1,6 +1,5 @@
-#![allow(unused_variables)]
-
 use anyhow::{Context, Result};
+use atomic_token_bucket::TokenBucket;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::error;
@@ -9,55 +8,69 @@ use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::ffi::OsStr;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Solana snapshot finder - rust port", long_about = None)]
+#[command(
+    author,
+    version,
+    about = "Solana snapshot finder - find and fetch solana snapshots",
+    long_about = "This program will probe multiple RPC nodes, pick one with best download speed and
+    fetch the snapshots from there. It will not fetch snapshots that are already present on your host."
+)]
 struct Args {
-    #[arg(short = 't', long = "threads-count", default_value_t = 1000)]
-    threads_count: usize,
-
     #[arg(
         short = 'r',
         long = "rpc_address",
         default_value = "https://api.mainnet-beta.solana.com"
     )]
+    /// Public RPC to use to fetch the gossip information
     rpc_address: String,
 
-    #[arg(long = "slot", default_value_t = 0)]
-    slot: u64,
+    #[arg(long, short)]
+    /// Search for a snapshot with a specific slot number (useful for network restarts)
+    /// If not provided, current slot is fetched from RPC.
+    slot: Option<u64>,
 
     #[arg(long = "max_snapshot_age", default_value_t = 1300)]
+    /// Maximum age of the snapshot relative to current slot to consider.
     max_snapshot_age: u64,
 
     #[arg(long = "min_download_speed", default_value_t = 60)]
+    /// Minimal download speed, Mbps. If RPC is slower than this, it will be skipped.
     min_download_speed: u64,
 
     #[arg(long = "max_download_speed")]
+    /// Maximal download speed, Mbps. Specifying this reduces load on the RPC node.
     max_download_speed: Option<u64>,
 
     #[arg(long = "max_latency", default_value_t = 200)]
+    /// Maximal latency to RPC in ms. High latency is bad for download speed.
     max_latency: u64,
 
     #[arg(long = "with_private_rpc", default_value_t = false)]
+    /// Enable adding and checking RPCs with the --private-rpc option.This slow down
+    /// checking and searching but potentially increases the number of RPCs from which
+    /// snapshots can be downloaded.
     with_private_rpc: bool,
 
-    #[arg(long = "measurement_time", default_value_t = 5)]
+    #[arg(long = "measurement_time", default_value_t = 3)]
+    /// How long to fetch the snapshot for in order to measure speed
     measurement_time: u64,
 
     #[arg(long = "snapshot_path", default_value = ".")]
+    /// Where to save snapshots
     snapshot_path: String,
 
     #[arg(long = "num_of_retries", default_value_t = 5)]
     num_of_retries: u32,
 
     #[arg(long = "sleep", default_value_t = 7)]
+    /// Time to sleep between attempts if no valid RPCs are found
     sleep: u64,
 
     #[arg(long = "sort_order", default_value = "latency")]
@@ -65,10 +78,11 @@ struct Args {
     sort_order: String,
 
     #[arg(short = 'b', long = "blacklist", default_value = "")]
+    /// If the same corrupted archive is constantly downloaded, you can exclude it. Specify
+    /// either the number of the slot you want to exclude, or the hash of the archive name.
+    /// You can specify several, separated by commas. Example: -b 135501350,135501360 or
+    /// --blacklist 135501350,some_hash
     blacklist: String,
-
-    #[arg(short = 'v', long = "verbose", default_value_t = false)]
-    verbose: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -77,17 +91,6 @@ struct RpcNodeInfo {
     slots_diff: i64,
     latency_ms: u64,
     files_to_download: Vec<String>,
-}
-
-fn convert_size(size_bytes: u128) -> String {
-    if size_bytes == 0 {
-        return "0B".into();
-    }
-    let size_name = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
-    let i = (size_bytes as f64).log(1024.0).floor() as usize;
-    let p = 1024u128.pow(i as u32);
-    let s = (size_bytes as f64) / (p as f64);
-    format!("{:.2} {}", s, size_name[i])
 }
 
 async fn measure_speed(url: &str, measure_time: u64) -> Result<f64> {
@@ -131,7 +134,6 @@ async fn measure_speed(url: &str, measure_time: u64) -> Result<f64> {
 }
 
 pub enum HttpRequest<'a> {
-    Get,
     Head,
     Post(&'a str),
 }
@@ -141,7 +143,6 @@ impl<'a> HttpRequest<'a> {
         let client = Client::builder().redirect(Policy::none()).build()?;
 
         let req = match self {
-            HttpRequest::Get => client.get(url),
             HttpRequest::Head => client.head(url),
             HttpRequest::Post(body) => client
                 .post(url)
@@ -320,7 +321,6 @@ async fn get_snapshot_slot(
             });
         }
     }
-
     None
 }
 
@@ -332,6 +332,17 @@ async fn download(
     let fname = url.rsplit('/').next().unwrap_or("snapshot.tar.bz2");
     let temp = format!("{}/tmp-{}", snapshot_path, fname);
     let dest = format!("{}/{}", snapshot_path, fname);
+
+    let token_bucket = if let Some(max_download_speed_mb) = max_download_speed_mb {
+        let max_speed_bytes_per_second = max_download_speed_mb * 125_000;
+        Some(TokenBucket::new(
+            max_speed_bytes_per_second,
+            max_speed_bytes_per_second,
+            max_speed_bytes_per_second as f64,
+        ))
+    } else {
+        None
+    };
 
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
@@ -359,8 +370,12 @@ async fn download(
     while let Some(chunk) = resp.chunk().await? {
         file.write_all(&chunk).await?;
         pbar.inc(chunk.len() as u64);
+        if let Some(token_bucket) = token_bucket.as_ref() {
+            while token_bucket.consume_tokens(chunk.len() as u64).is_err() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        }
     }
-
     file.flush().await?;
     tokio::fs::rename(temp, dest).await?;
     pbar.finish();
@@ -370,12 +385,7 @@ async fn download(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
-    if args.verbose {
-        env_logger::Builder::from_default_env().init();
-    } else {
-        env_logger::init();
-    }
+    env_logger::init();
 
     let mut full_local_snap_slot: u64 = 0;
     let snapshot_path = if args.snapshot_path.ends_with('/') {
@@ -393,13 +403,11 @@ async fn main() -> Result<()> {
     };
     let ip_blacklist: HashSet<String> = HashSet::new();
 
-    let num_attempts = 1u32;
-
     println!("RPC: {}", args.rpc_address);
 
     for num_attempts in 1..=args.num_of_retries {
-        let current_slot = if args.slot != 0 {
-            args.slot
+        let current_slot = if let Some(current_slot) = args.slot {
+            current_slot
         } else {
             get_current_slot(&args.rpc_address).await?
         };
@@ -407,8 +415,6 @@ async fn main() -> Result<()> {
             "Attempt number: {}. Current slot: {}",
             num_attempts, current_slot
         );
-
-        let nodes = Arc::new(Mutex::new(Vec::<RpcNodeInfo>::new()));
 
         let rpc_ips =
             get_all_rpc_ips(&args.rpc_address, args.with_private_rpc, &ip_blacklist).await?;
@@ -420,11 +426,7 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| format!("Error reading local snapshots from {snapshot_path}"))?;
         full_local_snapshots.sort();
-        if let Some(fname) = full_local_snapshots
-            .last()
-            .and_then(|p| p.file_name())
-            .and_then(OsStr::to_str)
-        {
+        if let Some(fname) = full_local_snapshots.last() {
             // pattern snapshot-<slot>-...
             let parts: Vec<&str> = fname.split('-').collect();
             if parts.len() >= 2 {
@@ -487,8 +489,6 @@ async fn main() -> Result<()> {
         }
         // measure speeds and try download
         let mut unsuitable_servers: HashSet<String> = HashSet::new();
-        let best_snapshot_node = String::new();
-        let num_of_rpc_to_check = 15usize;
 
         for (i, rpc_node) in nodes.iter().enumerate() {
             if !blacklist.is_empty()
@@ -514,22 +514,17 @@ async fn main() -> Result<()> {
             );
             let down_speed_bytes =
                 measure_speed(&rpc_node.snapshot_address, args.measurement_time).await?;
-            let down_speed_mb = convert_size(down_speed_bytes as u128);
             if down_speed_bytes < (args.min_download_speed as f64) * 1e6 {
-                println!("Too slow: {} {}", rpc_node.snapshot_address, down_speed_mb);
+                println!(
+                    "Too slow: {} {} Mbit/s",
+                    rpc_node.snapshot_address,
+                    down_speed_bytes / 1e6
+                );
                 unsuitable_servers.insert(rpc_node.snapshot_address.clone());
                 continue;
             } else {
                 for path in rpc_node.files_to_download.iter().rev() {
                     println!("Will download {path}");
-                    /*  if path.starts_with("/snapshot-") {
-                        let parts: Vec<&str> = path.split('-').collect();
-                        if parts.len() >= 2
-                            && full_local_snap_slot.map(|s| s == parts[1]).unwrap_or(false)
-                        {
-                            continue;
-                        }
-                    }*/
                     let mut candidate = String::new();
                     if path.contains("incremental") {
                         if let Ok(r) = HttpRequest::Head
@@ -572,7 +567,7 @@ async fn main() -> Result<()> {
     anyhow::bail!("Could not find a suitable snapshot")
 }
 
-pub async fn find_full_local_snapshots(snapshot_path: &str) -> Result<Vec<PathBuf>> {
+pub async fn find_full_local_snapshots(snapshot_path: &str) -> Result<Vec<String>> {
     let mut entries = tokio::fs::read_dir(snapshot_path)
         .await
         .context(format!("Can not read directory {snapshot_path}"))?;
@@ -583,14 +578,17 @@ pub async fn find_full_local_snapshots(snapshot_path: &str) -> Result<Vec<PathBu
         .await
         .context("Can not stat directory entry")?
     {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
+        let name = entry
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from);
+        if let Some(name) = name
+            && name.starts_with("snapshot-")
+            && name.contains("tar")
+        {
+            matches.push(name);
         };
-        if name.starts_with("snapshot-") && name.contains("tar") {
-            matches.push(path);
-        }
     }
-
     Ok(matches)
 }

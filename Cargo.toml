@@ -1,7 +1,15 @@
 [package]
 name = "solana-snapshot-fetcher"
+author = "Alex Pyattaev"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Fetcher for Solana snapshots"
+keywords = ["solana", "snapshot"]
+categories = [ "command-line-utilities", "cryptography::cryptocurrencies"]
+repository = "https://github.com/alexpyattaev/solana-snapshot-fetcher"
+homepage = "https://github.com/alexpyattaev/solana-snapshot-fetcher"
+readme = "README.md"
 
 [dependencies]
 
@@ -15,4 +23,4 @@ log = "0.4"
 env_logger = "0.10"
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-macros = "2.6.0"
-#futures-util = { version = "0.3.31", features = ["tokio-io"] }
+atomic_token_bucket = "0.1.0"
