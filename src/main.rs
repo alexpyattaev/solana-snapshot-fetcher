@@ -48,7 +48,7 @@ struct Args {
     /// Maximal download speed, Mbps. Specifying this reduces load on the RPC node.
     max_download_speed: Option<u64>,
 
-    #[arg(long = "max_latency", default_value_t = 200)]
+    #[arg(long = "max_latency", default_value_t = 300)]
     /// Maximal latency to RPC in ms. High latency is bad for download speed.
     max_latency: u64,
 
@@ -223,11 +223,13 @@ async fn get_snapshot_slot(
     let latency_ms = t0.elapsed().as_millis() as u64;
 
     if latency_ms > max_latency_ms {
+        dbg!("too slow");
         return None;
     }
 
     let headers_str = format!("{:?}", inc_resp.headers());
     if !headers_str.contains("location") {
+        dbg!("no location");
         return None;
     }
     if let Some(incremental_snap_location) = inc_resp
