@@ -139,7 +139,7 @@ pub enum HttpRequest<'a> {
 }
 
 impl<'a> HttpRequest<'a> {
-    pub async fn send(self, url: &str, timeout_secs: u64) -> Result<Response> {
+    pub async fn send(self, url: &str, timeout: Duration) -> Result<Response> {
         let client = Client::builder().redirect(Policy::none()).build()?;
 
         let req = match self {
@@ -150,10 +150,7 @@ impl<'a> HttpRequest<'a> {
                 .header("Content-Type", "application/json"),
         };
 
-        let resp = req
-            .timeout(Duration::from_secs(timeout_secs))
-            .send()
-            .await?;
+        let resp = req.timeout(timeout).send().await?;
 
         Ok(resp)
     }
@@ -161,7 +158,9 @@ impl<'a> HttpRequest<'a> {
 
 async fn get_current_slot(rpc: &str) -> Result<u64> {
     let d = r#"{"jsonrpc":"2.0","id":1, "method":"getSlot"}"#;
-    let r = HttpRequest::Post(d).send(rpc, 5).await?;
+    let r = HttpRequest::Post(d)
+        .send(rpc, Duration::from_secs(1))
+        .await?;
     let text = r.text().await?;
     if text.contains("result") {
         let v = serde_json::from_str::<Value>(&text)?;
@@ -180,7 +179,9 @@ async fn get_all_rpc_ips(
 ) -> Result<Vec<String>> {
     let d = r#"{"jsonrpc":"2.0", "id":1, "method":"getClusterNodes"}"#;
     let mut result_ips: Vec<String> = Vec::new();
-    let resp = HttpRequest::Post(d).send(rpc, 5).await?;
+    let resp = HttpRequest::Post(d)
+        .send(rpc, Duration::from_secs(5))
+        .await?;
     let txt = resp.text().await?;
     if !txt.contains("result") {
         anyhow::bail!("Can't get RPC ip addresses: {}", txt);
@@ -219,7 +220,10 @@ async fn get_snapshot_slot(
     let inc_url = format!("http://{rpc_address}/incremental-snapshot.tar.bz2");
 
     let t0 = Instant::now();
-    let inc_resp = match HttpRequest::Head.send(&inc_url, 3).await {
+    let inc_resp = match HttpRequest::Head
+        .send(&inc_url, Duration::from_millis(max_latency_ms * 2))
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             trace!("RPC request error {e}");
@@ -276,7 +280,10 @@ async fn get_snapshot_slot(
             });
         }
 
-        let full_resp = HttpRequest::Head.send(&url, 1).await.ok()?;
+        let full_resp = HttpRequest::Head
+            .send(&url, Duration::from_millis(max_latency_ms * 2))
+            .await
+            .ok()?;
 
         if let Some(full_snap_location) = full_resp
             .headers()
@@ -297,7 +304,10 @@ async fn get_snapshot_slot(
     }
 
     // check full snapshot if incremental didn't match
-    let full_resp = HttpRequest::Head.send(&url, 1).await.ok()?;
+    let full_resp = HttpRequest::Head
+        .send(&url, Duration::from_millis(max_latency_ms * 2))
+        .await
+        .ok()?;
 
     if let Some(full_snap_location) = full_resp
         .headers()
@@ -536,6 +546,7 @@ async fn main() -> Result<()> {
             } else {
                 for path in rpc_node.files_to_download.iter().rev() {
                     println!("Will download {path}");
+                    // TODO: why are we sending head again here?
                     let mut candidate = String::new();
                     if path.contains("incremental") {
                         if let Ok(r) = HttpRequest::Head
@@ -544,7 +555,7 @@ async fn main() -> Result<()> {
                                     "http://{}/incremental-snapshot.tar.bz2",
                                     rpc_node.snapshot_address
                                 ),
-                                2,
+                                Duration::from_secs(2),
                             )
                             .await
                         {
