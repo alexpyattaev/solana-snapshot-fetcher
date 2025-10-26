@@ -219,7 +219,13 @@ async fn get_snapshot_slot(
     let inc_url = format!("http://{rpc_address}/incremental-snapshot.tar.bz2");
 
     let t0 = Instant::now();
-    let inc_resp = HttpRequest::Head.send(&inc_url, 3).await.ok()?;
+    let inc_resp = match HttpRequest::Head.send(&inc_url, 3).await {
+        Ok(r) => r,
+        Err(e) => {
+            trace!("RPC request error {e}");
+            return None;
+        }
+    };
     let latency_ms = t0.elapsed().as_millis() as u64;
 
     if latency_ms > max_latency_ms {
@@ -326,7 +332,6 @@ async fn get_snapshot_slot(
     }
 
     trace!("No snapshots on {rpc_address}!");
-
     None
 }
 

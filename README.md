@@ -26,6 +26,12 @@ Testnet
 solana-snapshot-fetcher --snapshot_path $HOME/ledger -r http://api.testnet.solana.com
 ```
 
+## Troubleshooting
+
+```bash
+RUST_LOG="solana_snapshot_fetcher=trace" cargo run
+```
+
 ## Contributing
 
 PRs are welcome. Let us not have a million forks of this tool.
