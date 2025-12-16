@@ -48,7 +48,7 @@ struct Args {
     /// Maximal download speed, Mbps. Specifying this reduces load on the RPC node.
     max_download_speed: Option<u64>,
 
-    #[arg(long = "max_latency", default_value_t = 200)]
+    #[arg(long = "max_latency", default_value_t = 2000)]
     /// Maximal latency to RPC in ms. High latency is bad for download speed.
     max_latency: u64,
 
