@@ -8,10 +8,13 @@ use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
@@ -48,7 +51,7 @@ struct Args {
     /// Maximal download speed, Mbps. Specifying this reduces load on the RPC node.
     max_download_speed: Option<u64>,
 
-    #[arg(long = "max_latency", default_value_t = 2000)]
+    #[arg(long = "max_latency", default_value_t = 150)]
     /// Maximal latency to RPC in ms. High latency is bad for download speed.
     max_latency: u64,
 
@@ -95,7 +98,9 @@ struct RpcNodeInfo {
 
 async fn measure_speed(url: &str, measure_time: u64) -> Result<f64> {
     let full = format!("http://{}/snapshot.tar.bz2", url);
-    let client = Client::new();
+    let client = Client::builder()
+        .redirect(Policy::limited(10))
+        .build()?;
     let mut resp = client
         .get(&full)
         .timeout(Duration::from_secs(measure_time + 2))
@@ -139,9 +144,7 @@ pub enum HttpRequest<'a> {
 }
 
 impl<'a> HttpRequest<'a> {
-    pub async fn send(self, url: &str, timeout: Duration) -> Result<Response> {
-        let client = Client::builder().redirect(Policy::none()).build()?;
-
+    pub async fn send(self, client: &Client, url: &str, timeout: Duration) -> Result<Response> {
         let req = match self {
             HttpRequest::Head => client.head(url),
             HttpRequest::Post(body) => client
@@ -156,10 +159,10 @@ impl<'a> HttpRequest<'a> {
     }
 }
 
-async fn get_current_slot(rpc: &str) -> Result<u64> {
+async fn get_current_slot(client: &Client, rpc: &str) -> Result<u64> {
     let d = r#"{"jsonrpc":"2.0","id":1, "method":"getSlot"}"#;
     let r = HttpRequest::Post(d)
-        .send(rpc, Duration::from_secs(1))
+        .send(client, rpc, Duration::from_secs(5))
         .await?;
     let text = r.text().await?;
     if text.contains("result") {
@@ -173,6 +176,7 @@ async fn get_current_slot(rpc: &str) -> Result<u64> {
 }
 
 async fn get_all_rpc_ips(
+    client: &Client,
     rpc: &str,
     with_private: bool,
     ip_blacklist: &HashSet<String>,
@@ -180,7 +184,7 @@ async fn get_all_rpc_ips(
     let d = r#"{"jsonrpc":"2.0", "id":1, "method":"getClusterNodes"}"#;
     let mut result_ips: Vec<String> = Vec::new();
     let resp = HttpRequest::Post(d)
-        .send(rpc, Duration::from_secs(5))
+        .send(client, rpc, Duration::from_secs(15))
         .await?;
     let txt = resp.text().await?;
     if !txt.contains("result") {
@@ -210,20 +214,24 @@ async fn get_all_rpc_ips(
 }
 
 async fn get_snapshot_slot(
+    client: Arc<Client>,
+    semaphore: Arc<Semaphore>,
     rpc_address: String,
     full_local_snap_slot: u64,
     current_slot: u64,
     max_snapshot_age_in_slots: u64,
     max_latency_ms: u64,
 ) -> Option<RpcNodeInfo> {
+    let _permit = semaphore.acquire().await.ok()?;
+
     let url = format!("http://{rpc_address}/snapshot.tar.bz2");
     let inc_url = format!("http://{rpc_address}/incremental-snapshot.tar.bz2");
 
+    let inc_req = client
+        .head(&inc_url)
+        .timeout(Duration::from_millis(max_latency_ms * 2));
     let t0 = Instant::now();
-    let inc_resp = match HttpRequest::Head
-        .send(&inc_url, Duration::from_millis(max_latency_ms * 2))
-        .await
-    {
+    let inc_resp = match inc_req.send().await {
         Ok(r) => r,
         Err(e) => {
             trace!("RPC request error {e}");
@@ -281,7 +289,7 @@ async fn get_snapshot_slot(
         }
 
         let full_resp = HttpRequest::Head
-            .send(&url, Duration::from_millis(max_latency_ms * 2))
+            .send(&client, &url, Duration::from_millis(max_latency_ms * 2))
             .await
             .ok()?;
 
@@ -305,7 +313,7 @@ async fn get_snapshot_slot(
 
     // check full snapshot if incremental didn't match
     let full_resp = HttpRequest::Head
-        .send(&url, Duration::from_millis(max_latency_ms * 2))
+        .send(&client, &url, Duration::from_millis(max_latency_ms * 2))
         .await
         .ok()?;
 
@@ -426,19 +434,36 @@ async fn main() -> Result<()> {
 
     println!("RPC: {}", args.rpc_address);
 
+    let probe_client = Arc::new(
+        Client::builder()
+            .redirect(Policy::none())
+            .pool_max_idle_per_host(2)
+            .build()?,
+    );
+    let probe_concurrency = available_parallelism()
+        .unwrap_or(NonZeroUsize::new(4).expect("4 != 0"))
+        .get();
+    let probe_semaphore = Arc::new(Semaphore::new(probe_concurrency));
+    println!("Probe concurrency: {probe_concurrency}");
+
     for num_attempts in 1..=args.num_of_retries {
         let current_slot = if let Some(current_slot) = args.slot {
             current_slot
         } else {
-            get_current_slot(&args.rpc_address).await?
+            get_current_slot(&probe_client, &args.rpc_address).await?
         };
         println!(
             "Attempt number: {}. Current slot: {}",
             num_attempts, current_slot
         );
 
-        let rpc_ips =
-            get_all_rpc_ips(&args.rpc_address, args.with_private_rpc, &ip_blacklist).await?;
+        let rpc_ips = get_all_rpc_ips(
+            &probe_client,
+            &args.rpc_address,
+            args.with_private_rpc,
+            &ip_blacklist,
+        )
+        .await?;
 
         println!("RPC servers in total: {}", rpc_ips.len());
 
@@ -472,8 +497,12 @@ async fn main() -> Result<()> {
         let mut join_set = tokio::task::JoinSet::new();
         for rpc in rpc_ips.into_iter() {
             let pbar = Arc::clone(&pbar);
+            let client = Arc::clone(&probe_client);
+            let semaphore = Arc::clone(&probe_semaphore);
             join_set.spawn(async move {
                 let res = get_snapshot_slot(
+                    client,
+                    semaphore,
                     rpc,
                     full_local_snap_slot,
                     current_slot,
@@ -551,6 +580,7 @@ async fn main() -> Result<()> {
                     if path.contains("incremental") {
                         if let Ok(r) = HttpRequest::Head
                             .send(
+                                &probe_client,
                                 &format!(
                                     "http://{}/incremental-snapshot.tar.bz2",
                                     rpc_node.snapshot_address
