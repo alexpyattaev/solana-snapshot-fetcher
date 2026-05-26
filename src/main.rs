@@ -5,7 +5,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, trace};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Response};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -88,7 +87,7 @@ struct Args {
     blacklist: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 struct RpcNodeInfo {
     snapshot_address: String,
     slots_diff: i64,
